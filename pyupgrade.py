@@ -2,6 +2,7 @@ import argparse
 import ast
 import codecs
 import collections
+import contextlib
 import keyword
 import re
 import string
@@ -1195,6 +1196,14 @@ class FindPy3Plus(ast.NodeVisitor):
             self.def_depth = 0
             self.first_arg_name = ''
 
+    class FunctionInfo:
+        def __init__(self) -> None:
+            self.names: Set[str] = set()
+            self.in_loop = False
+            self.yield_from_fors: Set[Offset] = set()
+            self.yield_from_names: Dict[str, Set[Offset]]
+            self.yield_from_names = collections.defaultdict(set)
+
     def __init__(self) -> None:
         self.bases_to_remove: Set[Offset] = set()
 
@@ -1230,6 +1239,7 @@ class FindPy3Plus(ast.NodeVisitor):
         self._in_comp = 0
         self.super_calls: Dict[Offset, ast.Call] = {}
         self._in_async_def = False
+        self._function_info_stack: List[FindPy3Plus.FunctionInfo] = []
         self.yield_from_fors: Set[Offset] = set()
 
     def _is_six(self, node: ast.expr, names: Container[str]) -> bool:
@@ -1324,15 +1334,39 @@ class FindPy3Plus(ast.NodeVisitor):
         self.generic_visit(node)
         self._class_info_stack.pop()
 
-    def _visit_func(self, node: AnyFunctionDef) -> None:
-        if self._class_info_stack:
-            class_info = self._class_info_stack[-1]
-            class_info.def_depth += 1
-            if class_info.def_depth == 1 and node.args.args:
-                class_info.first_arg_name = node.args.args[0].arg
-            self.generic_visit(node)
+    @contextlib.contextmanager
+    def _track_def_depth(
+            self,
+            node: AnyFunctionDef,
+    ) -> Generator[None, None, None]:
+        class_info = self._class_info_stack[-1]
+        class_info.def_depth += 1
+        if class_info.def_depth == 1 and node.args.args:
+            class_info.first_arg_name = node.args.args[0].arg
+        try:
+            yield
+        finally:
             class_info.def_depth -= 1
-        else:
+
+    @contextlib.contextmanager
+    def _track_locals(self) -> Generator[None, None, None]:
+        self._function_info_stack.append(FindPy3Plus.FunctionInfo())
+        try:
+            yield
+        finally:
+            info = self._function_info_stack.pop()
+            # discard any that were referenced outside of the loop
+            for name in info.names:
+                offsets = info.yield_from_names[name]
+                info.yield_from_fors.difference_update(offsets)
+            self.yield_from_fors.update(info.yield_from_fors)
+            if self._function_info_stack:
+                self._function_info_stack[-1].names.update(info.names)
+
+    def _visit_func(self, node: AnyFunctionDef) -> None:
+        with contextlib.ExitStack() as ctx, self._track_locals():
+            if self._class_info_stack:
+                ctx.enter_context(self._track_def_depth(node))
             self.generic_visit(node)
 
     def _visit_sync_func(self, node: SyncFunctionDef) -> None:
@@ -1355,12 +1389,23 @@ class FindPy3Plus(ast.NodeVisitor):
     visit_ListComp = visit_SetComp = _visit_comp
     visit_DictComp = visit_GeneratorExp = _visit_comp
 
-    def _visit_simple(self, node: NameOrAttr) -> None:
+    def visit_Attribute(self, node: ast.Attribute) -> None:
         if self._is_six(node, SIX_SIMPLE_ATTRS):
             self.six_simple[_ast_to_offset(node)] = node
         self.generic_visit(node)
 
-    visit_Attribute = visit_Name = _visit_simple
+    def visit_Name(self, node: ast.Name) -> None:
+        if self._is_six(node, SIX_SIMPLE_ATTRS):
+            self.six_simple[_ast_to_offset(node)] = node
+
+        if (
+                self._function_info_stack and
+                not self._function_info_stack[-1].in_loop and
+                isinstance(node.ctx, ast.Load)
+        ):
+            self._function_info_stack[-1].names.add(node.id)
+
+        self.generic_visit(node)
 
     def visit_Try(self, node: ast.Try) -> None:
         for handler in node.handlers:
@@ -1559,6 +1604,15 @@ class FindPy3Plus(ast.NodeVisitor):
                 self.if_py3_blocks.add(_ast_to_offset(node))
         self.generic_visit(node)
 
+    @contextlib.contextmanager
+    def _in_loop(self) -> Generator[None, None, None]:
+        before = self._function_info_stack[-1].in_loop
+        self._function_info_stack[-1].in_loop = True
+        try:
+            yield
+        finally:
+            self._function_info_stack[-1].in_loop = before
+
     def visit_For(self, node: ast.For) -> None:
         if (
             not self._in_async_def and
@@ -1569,9 +1623,24 @@ class FindPy3Plus(ast.NodeVisitor):
             targets_same(node.target, node.body[0].value.value) and
             not node.orelse
         ):
-            self.yield_from_fors.add(_ast_to_offset(node))
-
-        self.generic_visit(node)
+            offset = _ast_to_offset(node)
+            func_info = self._function_info_stack[-1]
+            func_info.yield_from_fors.add(offset)
+            for target_node in ast.walk(node.target):
+                if (
+                        isinstance(target_node, ast.Name) and
+                        isinstance(target_node.ctx, ast.Store)
+                ):
+                    func_info.yield_from_names[target_node.id].add(offset)
+            # manually visit, but without instrumenting names in `body`
+            self.visit(node.target)
+            self.visit(node.iter)
+            with self._in_loop():
+                for stmt in node.body:
+                    self.visit(stmt)
+            assert not node.orelse
+        else:
+            self.generic_visit(node)
 
     def generic_visit(self, node: ast.AST) -> None:
         self._previous_node = node
