@@ -239,16 +239,6 @@ Availability:
 -from builtins import object  # python-future
 ```
 
-### rewrite `mock` imports
-
-Availability:
-- `--py3-plus` is passed on the commandline.
-
-```diff
--from mock import patch
-+from unittest.mock import patch
-```
-
 ### `yield` => `yield from`
 
 Availability:
